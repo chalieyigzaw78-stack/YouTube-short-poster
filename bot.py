@@ -4,17 +4,26 @@ YouTube Shorts Scheduler Bot
 Telegram bot that lets you upload videos, add a caption and schedule date/time,
 then automatically posts them to your YouTube channel as Shorts.
 
-FLOW:
-  1. Send a video to the bot
+Also supports auto-reposting from a source YouTube channel daily.
+
+FLOW (manual):
+  1. Send a video OR a YouTube URL to the bot
   2. Bot asks for title/caption
   3. Bot asks for schedule date/time (or "now")
   4. At scheduled time, bot uploads to YouTube Shorts automatically
+
+FLOW (auto-repost):
+  1. /setsource <YouTube channel URL>
+  2. /settime <HH:MM>  (daily repost time, e.g. 20:00)
+  3. /autorepost on
+  4. Bot downloads latest video from source channel daily and posts it
 
 ENV VARS:
   BOT_TOKEN=              Telegram bot token
   ADMIN_ID=               Your Telegram user ID
   YOUTUBE_CLIENT_SECRET=  Path to client_secret JSON file (or inline JSON string)
   YOUTUBE_TOKEN_FILE=     Path to store OAuth token (default: token.json)
+  YOUTUBE_TOKEN=          Full token JSON string (for Render, overrides file)
   DATABASE_URL=           PostgreSQL connection string (Neon)
   PORT=                   HTTP port for Render (default: 10000)
 """
@@ -24,12 +33,13 @@ import json
 import os
 import logging
 import tempfile
+import subprocess
 import aiohttp
 from aiohttp import web
-from datetime import datetime
+from datetime import datetime, time as dtime
 from dotenv import load_dotenv
 
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, ConversationHandler,
     ContextTypes, filters
@@ -47,9 +57,9 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN  = os.environ["BOT_TOKEN"]
-ADMIN_ID   = int(os.environ.get("ADMIN_ID", "0"))
-DATABASE_URL = os.environ["DATABASE_URL"]
+BOT_TOKEN             = os.environ["BOT_TOKEN"]
+ADMIN_ID              = int(os.environ.get("ADMIN_ID", "0"))
+DATABASE_URL          = os.environ["DATABASE_URL"]
 YOUTUBE_CLIENT_SECRET = os.environ.get("YOUTUBE_CLIENT_SECRET", "./client_secret.json")
 YOUTUBE_TOKEN_FILE    = os.environ.get("YOUTUBE_TOKEN_FILE", "./token.json")
 
@@ -70,7 +80,8 @@ def init_db():
         conn.execute("""
             CREATE TABLE IF NOT EXISTS scheduled_videos (
                 id SERIAL PRIMARY KEY,
-                file_id TEXT NOT NULL,
+                file_id TEXT,
+                source_url TEXT,
                 title TEXT NOT NULL,
                 description TEXT DEFAULT '',
                 scheduled_at TIMESTAMP NOT NULL,
@@ -80,6 +91,29 @@ def init_db():
                 created_at TIMESTAMP DEFAULT NOW()
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS bot_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
+        conn.commit()
+
+
+def get_setting(key: str, default: str = "") -> str:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT value FROM bot_settings WHERE key=%s", (key,)
+        ).fetchone()
+    return row[0] if row else default
+
+
+def set_setting(key: str, value: str):
+    with get_conn() as conn:
+        conn.execute("""
+            INSERT INTO bot_settings (key, value) VALUES (%s, %s)
+            ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value
+        """, (key, value))
         conn.commit()
 
 
@@ -87,18 +121,14 @@ def init_db():
 
 def get_youtube_service():
     creds = None
-
-    # Support token as env var (JSON string) or file path
     token_env = os.environ.get("YOUTUBE_TOKEN", "")
     if token_env.strip().startswith("{"):
         creds = Credentials.from_authorized_user_info(json.loads(token_env), SCOPES)
     elif os.path.exists(YOUTUBE_TOKEN_FILE):
         creds = Credentials.from_authorized_user_file(YOUTUBE_TOKEN_FILE, SCOPES)
 
-    # Refresh if expired
     if creds and creds.expired and creds.refresh_token:
         creds.refresh(Request())
-        # Save refreshed token back
         if token_env.strip().startswith("{"):
             os.environ["YOUTUBE_TOKEN"] = creds.to_json()
         else:
@@ -111,28 +141,59 @@ def get_youtube_service():
     return build("youtube", "v3", credentials=creds)
 
 
-def run_auth_flow():
-    """Run OAuth flow to get token. Call this once locally to generate token.json"""
-    # Support inline JSON string or file path
-    if YOUTUBE_CLIENT_SECRET.strip().startswith("{"):
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-            f.write(YOUTUBE_CLIENT_SECRET)
-            secret_path = f.name
-    else:
-        secret_path = YOUTUBE_CLIENT_SECRET
+# ── Download from YouTube URL ─────────────────────────────────────────────────
 
-    flow = InstalledAppFlow.from_client_secrets_file(secret_path, SCOPES)
-    creds = flow.run_local_server(port=0)
-    with open(YOUTUBE_TOKEN_FILE, "w") as f:
-        f.write(creds.to_json())
-    print(f"[auth] Token saved to {YOUTUBE_TOKEN_FILE}")
-    return creds
+async def download_youtube_video(url: str, output_path: str) -> str:
+    """Download a YouTube video using yt-dlp. Returns the actual file path."""
+    loop = asyncio.get_event_loop()
+
+    def _download():
+        cmd = [
+            "yt-dlp",
+            "--format", "bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+            "--merge-output-format", "mp4",
+            "--output", output_path,
+            "--no-playlist",
+            url
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if result.returncode != 0:
+            raise RuntimeError(f"yt-dlp failed: {result.stderr}")
+        return output_path
+
+    return await loop.run_in_executor(None, _download)
+
+
+async def get_channel_latest_video(channel_url: str) -> tuple[str, str]:
+    """Get the latest video URL and title from a YouTube channel."""
+    loop = asyncio.get_event_loop()
+
+    def _fetch():
+        cmd = [
+            "yt-dlp",
+            "--flat-playlist",
+            "--playlist-end", "5",
+            "--print", "%(id)s\t%(title)s",
+            channel_url
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if result.returncode != 0:
+            raise RuntimeError(f"yt-dlp channel fetch failed: {result.stderr}")
+        lines = [l.strip() for l in result.stdout.strip().split("\n") if l.strip()]
+        if not lines:
+            raise RuntimeError("No videos found on channel")
+        # Return first (latest) video
+        parts = lines[0].split("\t", 1)
+        video_id = parts[0]
+        title = parts[1] if len(parts) > 1 else "Untitled"
+        return f"https://www.youtube.com/watch?v={video_id}", title
+
+    return await loop.run_in_executor(None, _fetch)
 
 
 # ── Upload to YouTube ─────────────────────────────────────────────────────────
 
 async def upload_to_youtube(video_path: str, title: str, description: str = "") -> str:
-    """Upload video to YouTube as a Short. Returns YouTube video ID."""
     loop = asyncio.get_event_loop()
 
     def _upload():
@@ -142,7 +203,7 @@ async def upload_to_youtube(video_path: str, title: str, description: str = "") 
                 "title": title,
                 "description": description + "\n\n#Shorts",
                 "tags": ["Shorts"],
-                "categoryId": "22",  # People & Blogs
+                "categoryId": "22",
             },
             "status": {
                 "privacyStatus": "public",
@@ -168,26 +229,31 @@ async def scheduler_loop(bot):
         try:
             with get_conn() as conn:
                 rows = conn.execute("""
-                    SELECT id, file_id, title, description
+                    SELECT id, file_id, source_url, title, description
                     FROM scheduled_videos
                     WHERE posted = FALSE AND scheduled_at <= NOW()
                     ORDER BY scheduled_at ASC
                 """).fetchall()
 
-            for row_id, file_id, title, description in rows:
+            for row_id, file_id, source_url, title, description in rows:
                 logger.info(f"[scheduler] Processing video id={row_id} title={title}")
+                tmp_path = None
                 try:
-                    # Download video from Telegram
-                    file = await bot.get_file(file_id)
-                    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
-                        tmp_path = tmp.name
-                    await file.download_to_drive(tmp_path)
+                    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".mp4")
+                    os.close(tmp_fd)
 
-                    # Upload to YouTube
-                    yt_id = await upload_to_youtube(tmp_path, title, description)
-                    os.unlink(tmp_path)
+                    if source_url:
+                        # Download from YouTube URL
+                        await download_youtube_video(source_url, tmp_path)
+                    elif file_id:
+                        # Download from Telegram file
+                        file = await bot.get_file(file_id)
+                        await file.download_to_drive(tmp_path)
+                    else:
+                        raise RuntimeError("No file_id or source_url")
 
-                    # Mark as posted
+                    yt_id = await upload_to_youtube(tmp_path, title, description or "")
+
                     with get_conn() as conn:
                         conn.execute("""
                             UPDATE scheduled_videos
@@ -196,17 +262,14 @@ async def scheduler_loop(bot):
                         """, (yt_id, row_id))
                         conn.commit()
 
-                    # Notify admin
                     await bot.send_message(
                         ADMIN_ID,
-                        f"✅ ቪዲዮ ተለቀቀ!\n\n"
-                        f"📹 {title}\n"
-                        f"🔗 https://youtube.com/shorts/{yt_id}"
+                        f"✅ ቪዲዮ ተለቀቀ!\n\n📹 {title}\n🔗 https://youtube.com/shorts/{yt_id}"
                     )
                     logger.info(f"[scheduler] ✅ Posted: https://youtube.com/shorts/{yt_id}")
 
                 except Exception as e:
-                    logger.error(f"[scheduler] ❌ Failed to post video id={row_id}: {e}")
+                    logger.error(f"[scheduler] ❌ Failed id={row_id}: {e}")
                     with get_conn() as conn:
                         conn.execute(
                             "UPDATE scheduled_videos SET posted=TRUE, youtube_id=%s WHERE id=%s",
@@ -214,11 +277,92 @@ async def scheduler_loop(bot):
                         )
                         conn.commit()
                     await bot.send_message(ADMIN_ID, f"❌ ቪዲዮ መለቀቅ አልተቻለም:\n{title}\n\nስህተት: {e}")
+                finally:
+                    if tmp_path and os.path.exists(tmp_path):
+                        try:
+                            os.unlink(tmp_path)
+                        except Exception:
+                            pass
 
         except Exception as e:
             logger.error(f"[scheduler] DB error: {e}")
 
-        await asyncio.sleep(60)  # check every minute
+        await asyncio.sleep(60)
+
+
+# ── Auto-repost loop ──────────────────────────────────────────────────────────
+
+async def auto_repost_loop(bot):
+    """Daily auto-repost rotating through all source channels."""
+    while True:
+        try:
+            enabled     = get_setting("autorepost", "off")
+            repost_time = get_setting("repost_time", "20:00")
+            channels    = get_source_channels()
+
+            if enabled == "on" and channels:
+                now = datetime.now()
+                try:
+                    hour, minute = map(int, repost_time.split(":"))
+                except Exception:
+                    hour, minute = 20, 0
+
+                now_hm = (now.hour, now.minute)
+                if now_hm == (hour, minute):
+                    today_str   = now.strftime("%Y-%m-%d")
+                    last_repost = get_setting("last_autorepost_date", "")
+
+                    if last_repost != today_str:
+                        logger.info(f"[autorepost] Time to repost! {len(channels)} channels")
+
+                        # Pick next channel by rotating (index stored in settings)
+                        last_idx = int(get_setting("last_channel_idx", "-1"))
+                        next_idx = (last_idx + 1) % len(channels)
+                        source   = channels[next_idx]
+
+                        try:
+                            video_url, title = await get_channel_latest_video(source)
+
+                            with get_conn() as conn:
+                                existing = conn.execute(
+                                    "SELECT id FROM scheduled_videos WHERE source_url=%s",
+                                    (video_url,)
+                                ).fetchone()
+
+                            if existing:
+                                # Try next channel
+                                logger.info(f"[autorepost] Already reposted from {source}, trying next")
+                                next_idx = (next_idx + 1) % len(channels)
+                                source   = channels[next_idx]
+                                video_url, title = await get_channel_latest_video(source)
+
+                            with get_conn() as conn:
+                                conn.execute(
+                                    "INSERT INTO scheduled_videos (source_url, title, scheduled_at) VALUES (%s, %s, NOW())",
+                                    (video_url, title)
+                                )
+                                conn.commit()
+
+                            set_setting("last_autorepost_date", today_str)
+                            set_setting("last_channel_idx", str(next_idx))
+
+                            await bot.send_message(
+                                ADMIN_ID,
+                                f"🔄 Auto-repost ተጀምሯል!\n\n"
+                                f"📡 ምንጭ: {source}\n"
+                                f"📹 {title}\n\n"
+                                f"ቦቱ አሁን ያወርደዋል እና ይለቅቃል..."
+                            )
+                            logger.info(f"[autorepost] Scheduled from channel {next_idx+1}: {title}")
+
+                        except Exception as e:
+                            logger.error(f"[autorepost] Error: {e}")
+                            await bot.send_message(ADMIN_ID, f"❌ Auto-repost ስህተት:\n{e}")
+
+        except Exception as e:
+            logger.error(f"[autorepost] Loop error: {e}")
+
+        await asyncio.sleep(60)
 
 
 # ── Telegram handlers ─────────────────────────────────────────────────────────
@@ -229,9 +373,21 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         "📹 YouTube Shorts Scheduler Bot\n\n"
-        "ቪዲዮ ይላኩ → ርዕስ ያስፍሩ → ጊዜ ያቀናብሩ → ቦቱ ይለቅቃል!\n\n"
-        "ለመጀመር ቪዲዮ ይላኩ 👇",
-        reply_markup=ReplyKeyboardRemove()
+        "━━━━━━━━━━━━━━━━━━\n"
+        "📤 *ቪዲዮ ለማስቀጠር:*\n"
+        "• ቪዲዮ ፋይል ይላኩ\n"
+        "• ወይም YouTube URL ይላኩ\n\n"
+        "🔄 *Auto-repost:*\n"
+        "/setsource <channel URL>\n"
+        "/settime <HH:MM> (ለምሳሌ: 20:00)\n"
+        "/autorepost on\n\n"
+        "📋 *ሌሎች ትዕዛዞች:*\n"
+        "/list — ቀጠሮዎችን ይመልከቱ\n"
+        "/status — የ auto-repost ሁኔታ\n"
+        "/cancel — ይቅር\n"
+        "━━━━━━━━━━━━━━━━━━",
+        reply_markup=ReplyKeyboardRemove(),
+        parse_mode="Markdown"
     )
 
 
@@ -245,8 +401,24 @@ async def receive_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return WAIT_VIDEO
 
     ctx.user_data["file_id"] = video.file_id
+    ctx.user_data["source_url"] = None
+    await update.message.reply_text("✅ ቪዲዮ ተቀብሏል!\n\n📝 የቪዲዮውን ርዕስ ያስፍሩ:")
+    return WAIT_TITLE
+
+
+async def receive_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle YouTube URL sent as a message."""
+    if update.effective_user.id != ADMIN_ID:
+        return ConversationHandler.END
+
+    url = update.message.text.strip()
+    ctx.user_data["source_url"] = url
+    ctx.user_data["file_id"] = None
+
     await update.message.reply_text(
-        "✅ ቪዲዮ ተቀብሏል!\n\n📝 የቪዲዮውን ርዕስ ያስፍሩ:"
+        f"✅ YouTube URL ተቀብሏል!\n\n"
+        f"🔗 {url}\n\n"
+        f"📝 የቪዲዮውን ርዕስ ያስፍሩ (ወይም ✅ ለዋናው ርዕስ ይጠቀሙ):"
     )
     return WAIT_TITLE
 
@@ -260,7 +432,7 @@ async def receive_title(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(
         "🕐 መቼ ይለቀቅ?\n\n"
-        "• **አሁን ይለቀቅ** ለመጫን ወዲያውኑ\n"
+        "• **አሁን ይለቀቅ** ለወዲያውኑ\n"
         "• ወይም ቀን እና ሰዓት ያስፍሩ:\n"
         "  ቅርጸት: `2026-11-15 20:00`",
         reply_markup=keyboard,
@@ -284,25 +456,21 @@ async def receive_schedule(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             return WAIT_SCHEDULE
 
-    file_id = ctx.user_data["file_id"]
-    title   = ctx.user_data["title"]
+    file_id    = ctx.user_data.get("file_id")
+    source_url = ctx.user_data.get("source_url")
+    title      = ctx.user_data["title"]
 
     with get_conn() as conn:
         conn.execute(
-            "INSERT INTO scheduled_videos (file_id, title, scheduled_at) VALUES (%s, %s, %s)",
-            (file_id, title, scheduled_at)
+            "INSERT INTO scheduled_videos (file_id, source_url, title, scheduled_at) VALUES (%s, %s, %s, %s)",
+            (file_id, source_url, title, scheduled_at)
         )
         conn.commit()
 
-    if text == "አሁን ይለቀቅ":
-        time_str = "አሁን ወዲያውኑ"
-    else:
-        time_str = scheduled_at.strftime("%Y-%m-%d %H:%M")
+    time_str = "አሁን ወዲያውኑ" if text == "አሁን ይለቀቅ" else scheduled_at.strftime("%Y-%m-%d %H:%M")
 
     await update.message.reply_text(
-        f"✅ ቀጠሮ ተይዟል!\n\n"
-        f"📹 {title}\n"
-        f"🕐 {time_str}\n\n"
+        f"✅ ቀጠሮ ተይዟል!\n\n📹 {title}\n🕐 {time_str}\n\n"
         f"ቦቱ በተቀናበረው ሰዓት ወደ YouTube Shorts ይለቅቃል።",
         reply_markup=ReplyKeyboardRemove()
     )
@@ -319,7 +487,7 @@ async def list_scheduled(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     with get_conn() as conn:
         rows = conn.execute("""
-            SELECT title, scheduled_at, posted, youtube_id
+            SELECT title, scheduled_at, posted, youtube_id, source_url
             FROM scheduled_videos
             ORDER BY scheduled_at DESC LIMIT 20
         """).fetchall()
@@ -327,12 +495,139 @@ async def list_scheduled(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("ምንም ቀጠሮ የለም።")
         return
     lines = ["📋 የቀጠሮ ዝርዝር:\n"]
-    for title, sched, posted, yt_id in rows:
+    for title, sched, posted, yt_id, source_url in rows:
         status = "✅" if posted else "⏳"
         time_str = sched.strftime("%Y-%m-%d %H:%M")
-        link = f" → youtu.be/shorts/{yt_id}" if posted and yt_id and not yt_id.startswith("ERROR") else ""
-        lines.append(f"{status} {title} — {time_str}{link}")
+        src = " 🔄" if source_url else ""
+        link = f"\n   🔗 youtu.be/shorts/{yt_id}" if posted and yt_id and not str(yt_id).startswith("ERROR") else ""
+        lines.append(f"{status}{src} {title} — {time_str}{link}")
     await update.message.reply_text("\n".join(lines))
+
+
+def get_source_channels() -> list:
+    raw = get_setting("source_channels", "")
+    return [c.strip() for c in raw.split("\n") if c.strip()]
+
+
+def save_source_channels(channels: list):
+    set_setting("source_channels", "\n".join(channels))
+
+
+async def cmd_set_source(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    if not ctx.args:
+        channels = get_source_channels()
+        if channels:
+            lines = "\n".join(f"{i+1}. {c}" for i, c in enumerate(channels))
+            await update.message.reply_text(
+                f"📡 Source channels ({len(channels)}):\n\n{lines}\n\n"
+                f"ለመጨመር: `/setsource https://youtube.com/@channel`\n"
+                f"ለማስወገድ: `/removesource 1` (ቁጥር)",
+                parse_mode="Markdown"
+            )
+        else:
+            await update.message.reply_text(
+                "❌ ምንም source channel የለም።\n`/setsource https://youtube.com/@channelname`",
+                parse_mode="Markdown"
+            )
+        return
+    url = ctx.args[0].strip()
+    channels = get_source_channels()
+    if url in channels:
+        await update.message.reply_text("⚠️ ይህ channel ቀድሞ ተጨምሯል።")
+        return
+    channels.append(url)
+    save_source_channels(channels)
+    await update.message.reply_text(
+        f"✅ Source channel ተጨምሯል! ({len(channels)} ጠቅላላ)\n\n🔗 {url}\n\n"
+        f"አሁን `/autorepost on` ብለው auto-repost ያብሩ።",
+        parse_mode="Markdown"
+    )
+
+
+async def cmd_remove_source(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    channels = get_source_channels()
+    if not ctx.args:
+        await update.message.reply_text("❌ ቁጥር ያስፍሩ: `/removesource 1`", parse_mode="Markdown")
+        return
+    try:
+        idx = int(ctx.args[0]) - 1
+        removed = channels.pop(idx)
+        save_source_channels(channels)
+        await update.message.reply_text(f"✅ ተወግዷል:\n{removed}")
+    except (ValueError, IndexError):
+        await update.message.reply_text("❌ ትክክለኛ ቁጥር ያስፍሩ።")
+
+
+async def cmd_set_time(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    if not ctx.args:
+        await update.message.reply_text(
+            "❌ ሰዓት ያስፍሩ:\n`/settime 20:00`",
+            parse_mode="Markdown"
+        )
+        return
+    t = ctx.args[0].strip()
+    try:
+        hour, minute = map(int, t.split(":"))
+        assert 0 <= hour <= 23 and 0 <= minute <= 59
+    except Exception:
+        await update.message.reply_text("❌ ቅርጸት ትክክል አይደለም። ለምሳሌ: `/settime 20:00`", parse_mode="Markdown")
+        return
+    set_setting("repost_time", t)
+    await update.message.reply_text(f"✅ የቀጠሮ ሰዓት ተቀናብሯል: {t} ቦ.ሠ. ዕለት ዕለት")
+
+
+async def cmd_autorepost(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    if not ctx.args or ctx.args[0].lower() not in ("on", "off"):
+        await update.message.reply_text("❌ `/autorepost on` ወይም `/autorepost off`", parse_mode="Markdown")
+        return
+    state = ctx.args[0].lower()
+    set_setting("autorepost", state)
+
+    if state == "on":
+        channels    = get_source_channels()
+        repost_time = get_setting("repost_time", "20:00")
+        if not channels:
+            await update.message.reply_text(
+                "⚠️ ምንም source channel አልተጨመረም!\n`/setsource <URL>` ያስፍሩ።",
+                parse_mode="Markdown"
+            )
+            return
+        ch_lines = "\n".join(f"  {i+1}. {c}" for i, c in enumerate(channels))
+        await update.message.reply_text(
+            f"✅ Auto-repost ተበርቷል!\n\n"
+            f"📡 Channels ({len(channels)}):\n{ch_lines}\n\n"
+            f"🕐 ሰዓት: {repost_time} ዕለት ዕለት\n\n"
+            f"ቦቱ ዕለት ዕለት channels ሲቀያይር ቪዲዮ ይለቅቃል።"
+        )
+    else:
+        await update.message.reply_text("✅ Auto-repost ተዘግቷል።")
+
+
+async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    enabled     = get_setting("autorepost", "off")
+    repost_time = get_setting("repost_time", "20:00")
+    last        = get_setting("last_autorepost_date", "ገና አልተለቀቀም")
+    channels    = get_source_channels()
+
+    status_icon = "🟢" if enabled == "on" else "🔴"
+    ch_lines = "\n".join(f"  {i+1}. {c}" for i, c in enumerate(channels)) if channels else "  ምንም የለም"
+    await update.message.reply_text(
+        f"📊 Bot Status\n\n"
+        f"{status_icon} Auto-repost: {enabled.upper()}\n"
+        f"🕐 ሰዓት: {repost_time} ዕለት ዕለት\n"
+        f"📅 ላለፈው repost: {last}\n\n"
+        f"📡 Source channels ({len(channels)}):\n{ch_lines}"
+    )
 
 
 # ── Web server ────────────────────────────────────────────────────────────────
@@ -352,8 +647,6 @@ async def start_web_server():
     await site.start()
     logger.info(f"[web] Listening on port {port}")
 
-
-# ── Self-ping ─────────────────────────────────────────────────────────────────
 
 async def self_ping_loop():
     port = int(os.environ.get("PORT", 10000))
@@ -376,8 +669,14 @@ async def run():
 
     tg_app = Application.builder().token(BOT_TOKEN).build()
 
+    # URL pattern for YouTube links
+    yt_url_filter = filters.Regex(r'https?://(www\.)?(youtube\.com|youtu\.be)/\S+')
+
     conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.VIDEO | filters.Document.VIDEO, receive_video)],
+        entry_points=[
+            MessageHandler(filters.VIDEO | filters.Document.VIDEO, receive_video),
+            MessageHandler(yt_url_filter, receive_url),
+        ],
         states={
             WAIT_VIDEO:    [MessageHandler(filters.VIDEO | filters.Document.VIDEO, receive_video)],
             WAIT_TITLE:    [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_title)],
@@ -388,12 +687,18 @@ async def run():
 
     tg_app.add_handler(CommandHandler("start", start))
     tg_app.add_handler(CommandHandler("list", list_scheduled))
+    tg_app.add_handler(CommandHandler("status", cmd_status))
+    tg_app.add_handler(CommandHandler("setsource", cmd_set_source))
+    tg_app.add_handler(CommandHandler("removesource", cmd_remove_source))
+    tg_app.add_handler(CommandHandler("settime", cmd_set_time))
+    tg_app.add_handler(CommandHandler("autorepost", cmd_autorepost))
     tg_app.add_handler(conv)
 
     async with tg_app:
         await tg_app.start()
         await tg_app.updater.start_polling(allowed_updates=["message"])
         asyncio.create_task(scheduler_loop(tg_app.bot))
+        asyncio.create_task(auto_repost_loop(tg_app.bot))
         asyncio.create_task(self_ping_loop())
         await asyncio.Event().wait()
         await tg_app.updater.stop()
